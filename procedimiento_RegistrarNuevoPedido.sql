@@ -1,50 +1,135 @@
--- ==========================================================================================
--- SP Nombre:       ActualizarEstadoPedido
--- Descripción:     Permite actualizar ShippedDate y ShipVia de un pedido, solo si
---                  el pedido no ha sido enviado previamente.
--- ==========================================================================================
-CREATE OR ALTER PROCEDURE dbo.ActualizarEstadoPedido
-    @OrderID INT,
-    @NewShippedDate DATETIME,
-    @NewShipVia INT
+CREATE OR ALTER PROCEDURE dbo.RegistrarNuevoPedido
+    -- Parámetros para la tabla Orders
+    @CustomerID NCHAR(5),
+    @EmployeeID INT,
+    @OrderDate DATETIME,
+    @RequiredDate DATETIME,
+    @ShippedDate DATETIME = NULL,
+    @ShipVia INT,
+    @Freight MONEY = 0,
+    @ShipName NVARCHAR(40),
+    @ShipAddress NVARCHAR(60),
+    @ShipCity NVARCHAR(15),
+    @ShipRegion NVARCHAR(15) = NULL,
+    @ShipPostalCode NVARCHAR(10) = NULL,
+    @ShipCountry NVARCHAR(15),
+    -- Parámetro de tipo tabla para los detalles del pedido
+    @OrderDetailsTVP OrderDetailType READONLY
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @ErrorMessage NVARCHAR(2048);
-    DECLARE @CurrentShippedDate DATETIME;
-    DECLARE @OrderDate DATETIME;
+    DECLARE @NewOrderID INT;
+    DECLARE @CurrentProductID INT;
+    DECLARE @CurrentQuantity SMALLINT;
+    DECLARE @StockAvailable SMALLINT;
+    DECLARE @ProductName NVARCHAR(40);
+    DECLARE @ErrorMessage NVARCHAR(2048); -- Variable para construir mensajes de error
 
     BEGIN TRANSACTION;
+
     BEGIN TRY
-        SELECT @CurrentShippedDate = o.ShippedDate, @OrderDate = o.OrderDate
-        FROM dbo.Orders o WHERE o.OrderID = @OrderID;
+        -- 1. Validar existencia de CustomerID, EmployeeID y ShipperID
+        IF NOT EXISTS (SELECT 1 FROM dbo.Customers WHERE CustomerID = @CustomerID)
+        BEGIN
+            SET @ErrorMessage = FORMATMESSAGE('El CustomerID proporcionado ''%s'' no existe.', @CustomerID);
+            THROW 50001, @ErrorMessage, 1;
+        END
 
-        IF @OrderDate IS NULL
-            THROW 50010, 'El pedido con OrderID %d no existe.', 1;
+        IF NOT EXISTS (SELECT 1 FROM dbo.Employees WHERE EmployeeID = @EmployeeID)
+        BEGIN
+            SET @ErrorMessage = FORMATMESSAGE('El EmployeeID proporcionado ''%d'' no existe.', @EmployeeID);
+            THROW 50002, @ErrorMessage, 1;
+        END
 
-        IF @CurrentShippedDate IS NOT NULL
-            THROW 50011, 'El pedido OrderID %d ya fue enviado y no puede ser modificado.', 1;
+        IF NOT EXISTS (SELECT 1 FROM dbo.Shippers WHERE ShipperID = @ShipVia)
+        BEGIN
+            SET @ErrorMessage = FORMATMESSAGE('El ShipVia (ShipperID) proporcionado ''%d'' no existe.', @ShipVia);
+            THROW 50003, @ErrorMessage, 1;
+        END
 
-        IF NOT EXISTS (SELECT 1 FROM dbo.Shippers WHERE ShipperID = @NewShipVia)
-            THROW 50012, 'El transportista (ShipVia) con ID %d no existe.', 1;
-        
-        IF @NewShippedDate IS NOT NULL AND @NewShippedDate < @OrderDate
-            THROW 50013, 'La nueva fecha de envío no puede ser anterior a la fecha del pedido.', 1;
+        -- 2. Validar stock para cada producto en el TVP
+        DECLARE product_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT ProductID, Quantity FROM @OrderDetailsTVP;
 
-        UPDATE dbo.Orders
-        SET ShippedDate = @NewShippedDate, ShipVia = @NewShipVia
-        WHERE OrderID = @OrderID;
+        OPEN product_cursor;
+        FETCH NEXT FROM product_cursor INTO @CurrentProductID, @CurrentQuantity;
 
-        IF @@ROWCOUNT = 0
-            THROW 50014, 'No se pudo actualizar el pedido OrderID %d.', 1;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SELECT
+                @StockAvailable = p.UnitsInStock,
+                @ProductName = p.ProductName
+            FROM dbo.Products p
+            WHERE p.ProductID = @CurrentProductID;
 
-        PRINT 'Estado del pedido OrderID ' + CAST(@OrderID AS VARCHAR(10)) + ' actualizado.';
+            IF @StockAvailable IS NULL -- Significa que el ProductID no se encontró en la tabla Products
+            BEGIN
+                CLOSE product_cursor;
+                DEALLOCATE product_cursor;
+                SET @ErrorMessage = FORMATMESSAGE('El producto ID %d especificado en los detalles del pedido no existe en la tabla Products.', @CurrentProductID);
+                THROW 50004, @ErrorMessage, 1;
+            END
+
+            IF @StockAvailable < @CurrentQuantity
+            BEGIN
+                CLOSE product_cursor;
+                DEALLOCATE product_cursor;
+                SET @ErrorMessage = FORMATMESSAGE('Stock insuficiente para el producto "%s" (ID: %d). Solicitado: %d, Disponible: %d.', @ProductName, @CurrentProductID, @CurrentQuantity, @StockAvailable);
+                THROW 50005, @ErrorMessage, 1;
+            END
+
+            FETCH NEXT FROM product_cursor INTO @CurrentProductID, @CurrentQuantity;
+        END
+
+        CLOSE product_cursor;
+        DEALLOCATE product_cursor;
+
+        -- 3. Insertar en la tabla Orders
+        INSERT INTO dbo.Orders (
+            CustomerID, EmployeeID, OrderDate, RequiredDate, ShippedDate,
+            ShipVia, Freight, ShipName, ShipAddress, ShipCity,
+            ShipRegion, ShipPostalCode, ShipCountry
+        )
+        VALUES (
+            @CustomerID, @EmployeeID, @OrderDate, @RequiredDate, @ShippedDate,
+            @ShipVia, @Freight, @ShipName, @ShipAddress, @ShipCity,
+            @ShipRegion, @ShipPostalCode, @ShipCountry
+        );
+
+        SET @NewOrderID = SCOPE_IDENTITY();
+
+        -- 4. Insertar en la tabla Order Details y actualizar stock
+        INSERT INTO dbo.[Order Details] (
+            OrderID, ProductID, UnitPrice, Quantity, Discount
+        )
+        SELECT
+            @NewOrderID,
+            tvp.ProductID,
+            tvp.UnitPrice,
+            tvp.Quantity,
+            tvp.Discount
+        FROM @OrderDetailsTVP tvp;
+
+        UPDATE p
+        SET p.UnitsInStock = p.UnitsInStock - od.Quantity
+        FROM dbo.Products p
+        INNER JOIN @OrderDetailsTVP od ON p.ProductID = od.ProductID;
+
         COMMIT TRANSACTION;
+
+        SELECT @NewOrderID AS NewOrderID;
+        PRINT 'Pedido ' + CAST(@NewOrderID AS VARCHAR(10)) + ' registrado exitosamente.';
+
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        -- Relanzar el error. El mensaje ya fue formateado si provino de un THROW nuestro.
+        -- Si es un error del sistema, se relanzará tal cual.
         THROW;
+        -- RETURN; -- No es estrictamente necesario después de THROW si es la última instrucción en CATCH
     END CATCH
 END
 GO
