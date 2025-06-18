@@ -6,9 +6,11 @@ En este repositorio se detallan los procedimientos almacenados desarrollados par
 ---
 
 ## 📁 Contenido del Proyecto
--
--
--
+- crear_tabla_EmployeeBonuses.sql: script para crear la tabla auxiliar.
+- crear_tipo_OrderDetailType.sql: script para crear el tipo de tabla (TVP).
+- procedimiento_RegistrarNuevoPedido.sql: script del procedimiento con validaciones y transacciones.
+- procedimiento_ActualizarEstadoPedido.sql: script del segundo procedimiento con control de envíos.
+- Actividad_automatización_en_bases_de_datos.pdf: informe más detallado del proyecto (ncluye los scripts de pruebas exitosas y fallidas).
 
 ---
 
